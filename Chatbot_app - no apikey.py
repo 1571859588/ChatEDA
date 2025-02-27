@@ -1,8 +1,47 @@
 import os
+os.environ["HF_HOME"] = "D:\\Research"
 import streamlit as st
 from openai import OpenAI
-# Add new imports for PDF processing
 from PyPDF2 import PdfReader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+import torch
+
+# Initialize the embeddings model
+@st.cache_resource
+def get_embeddings_model():
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
+    )
+
+# Initialize the vector store
+@st.cache_resource
+def get_vector_store(_text_chunks, _embeddings):
+    return FAISS.from_texts(texts=_text_chunks, embedding=_embeddings)
+
+# Text splitting function
+def split_text(text):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len
+    )
+    return text_splitter.split_text(text)
+
+# Initialize the client based on the selected API endpoint
+def get_client():
+    if api_endpoint == "远程API":
+        return OpenAI(
+            api_key="xxx",
+            base_url="xxxx",
+        )
+    else:
+        return OpenAI(
+            api_key="not-needed",
+            base_url="http://localhost:8000/v1"
+        )
 
 with st.sidebar:
     st.markdown (f"""
@@ -20,17 +59,38 @@ with st.sidebar:
         
         # Process uploaded PDFs
         all_text = ""
-        for uploaded_file in uploaded_files:
-            try:
-                pdf_reader = PdfReader(uploaded_file)
-                for page in pdf_reader.pages:
-                    all_text += page.extract_text() + "\n"
-                st.success(f"成功读取文件: {uploaded_file.name}")
-            except Exception as e:
-                st.error(f"读取文件 {uploaded_file.name} 时出错: {str(e)}")
-        
-        if all_text:
-            st.session_state['pdf_text'] = all_text
+        with st.spinner("正在处理PDF文件..."):
+            for uploaded_file in uploaded_files:
+                try:
+                    pdf_reader = PdfReader(uploaded_file)
+                    for page in pdf_reader.pages:
+                        all_text += page.extract_text() + "\n"
+                    st.success(f"成功读取文件: {uploaded_file.name}")
+                except Exception as e:
+                    st.error(f"读取文件 {uploaded_file.name} 时出错: {str(e)}")
+            
+            if all_text:
+                # Split text into chunks
+                text_chunks = split_text(all_text)
+                st.write(f"文档已分割成 {len(text_chunks)} 个片段")
+                
+                # Create vector store
+                embeddings = get_embeddings_model()
+                vector_store = get_vector_store(text_chunks, embeddings)
+                st.session_state['vector_store'] = vector_store
+                st.success("文档向量化完成！")
+
+    api_endpoint = st.selectbox(
+        "API端点",
+        ["远程API", "本地API"],
+        help="选择使用远程还是本地API"
+    )
+    
+    model_option = st.selectbox(
+        "选择模型",
+        ["qwen-vl-max", "qwen-2.5-32k", "qwen-2.5-32b", "local-model"] if api_endpoint == "远程API" else ["local-model"],
+        help="选择要使用的AI模型"
+    )
     
     #角色定义输人框System Message
     system_message=st.text_area("角色定义","你是一个EDA领域的专家，能够理解EDA工具的使用以及EDA工具涉及的专业词汇，如芯片、针脚等等。")
@@ -88,28 +148,38 @@ client = OpenAI(
 if "messagesHistory" not in st.session_state:
     messagesHistory = []
 
+def get_relevant_chunks(query, top_k=3):
+    if 'vector_store' in st.session_state:
+        results = st.session_state['vector_store'].similarity_search(query, k=top_k)
+        return "\n".join([doc.page_content for doc in results])
+    return None
 
 def chat_stream(query, system_message=None, temperature=1):
-    #Chat
+    client = get_client()
+    
     if system_message:
         messagesHistory.append({"role":"system","content":system_message})
     
-    # Add context from PDF if available
-    if 'pdf_text' in st.session_state:
-        context_message = f"以下是相关文档的内容，请基于这些内容回答用户的问题：\n\n{st.session_state['pdf_text']}\n\n用户问题：{query}"
+    # Get relevant chunks instead of using entire PDF
+    relevant_context = get_relevant_chunks(query)
+    if relevant_context:
+        context_message = f"以下是相关文档的内容，请基于这些内容回答用户的问题：\n\n{relevant_context}\n\n用户问题：{query}"
         messagesHistory.append({"role":"user","content":context_message})
     else:
         messagesHistory.append({"role":"user","content":query})
     
-    response = client.chat.completions.create(
-        model="qwen-vl-max",
-        messages=messagesHistory,
-        stream=True,
-        temperature=temperature
-    )
-    return response
+    try:
+        response = client.chat.completions.create(
+            model=model_option,
+            messages=messagesHistory,
+            stream=True,
+            temperature=temperature
+        )
+        return response
+    except Exception as e:
+        st.error(f"API调用错误: {str(e)}")
+        return None
 
-# ... rest of the existing code ...
 
 
 #用户输入
